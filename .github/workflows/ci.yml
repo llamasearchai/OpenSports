@@ -1,0 +1,491 @@
+name: OpenSports CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "18"
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: opensports
+
+jobs:
+  # Code Quality and Security Analysis
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    outputs:
+      quality-score: ${{ steps.quality.outputs.score }}
+      security-passed: ${{ steps.security.outputs.passed }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pylint flake8 mypy bandit safety black isort
+
+    - name: Code formatting check
+      run: |
+        black --check opensports/
+        isort --check-only opensports/
+
+    - name: Lint with pylint
+      id: pylint
+      run: |
+        pylint opensports/ --output-format=json --reports=y > pylint-report.json || true
+        SCORE=$(pylint opensports/ --reports=y | grep "Your code has been rated at" | awk '{print $7}' | cut -d'/' -f1)
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+
+    - name: Lint with flake8
+      run: |
+        flake8 opensports/ --count --statistics --output-file=flake8-report.txt
+
+    - name: Type check with mypy
+      run: |
+        mypy opensports/ --ignore-missing-imports --html-report mypy-report/
+
+    - name: Security scan with bandit
+      id: bandit
+      run: |
+        bandit -r opensports/ -f json -o bandit-report.json || true
+        HIGH_ISSUES=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-report.json)
+        echo "high-issues=$HIGH_ISSUES" >> $GITHUB_OUTPUT
+
+    - name: Dependency security check
+      id: safety
+      run: |
+        safety check --json --output safety-report.json || true
+        VULNS=$(jq 'length' safety-report.json)
+        echo "vulnerabilities=$VULNS" >> $GITHUB_OUTPUT
+
+    - name: Calculate quality score
+      id: quality
+      run: |
+        PYLINT_SCORE=${{ steps.pylint.outputs.score }}
+        FLAKE8_VIOLATIONS=$(wc -l < flake8-report.txt)
+        HIGH_SECURITY=$(echo "${{ steps.bandit.outputs.high-issues }}")
+        VULNS=$(echo "${{ steps.safety.outputs.vulnerabilities }}")
+        
+        # Calculate composite quality score
+        QUALITY_SCORE=$(python -c "
+        import sys
+        pylint = float('$PYLINT_SCORE' or 0) * 0.4
+        flake8_penalty = min(int('$FLAKE8_VIOLATIONS' or 0) * 0.1, 3.0)
+        security_penalty = int('$HIGH_SECURITY' or 0) * 2.0 + int('$VULNS' or 0) * 1.0
+        score = max(pylint - flake8_penalty - security_penalty, 0.0)
+        print(f'{score:.2f}')
+        ")
+        
+        echo "score=$QUALITY_SCORE" >> $GITHUB_OUTPUT
+        echo "Quality Score: $QUALITY_SCORE"
+
+    - name: Security gate
+      id: security
+      run: |
+        HIGH_ISSUES=${{ steps.bandit.outputs.high-issues }}
+        VULNS=${{ steps.safety.outputs.vulnerabilities }}
+        
+        if [ "$HIGH_ISSUES" -eq 0 ] && [ "$VULNS" -eq 0 ]; then
+          echo "passed=true" >> $GITHUB_OUTPUT
+          echo "Security gate passed"
+        else
+          echo "passed=false" >> $GITHUB_OUTPUT
+          echo "Security gate failed: $HIGH_ISSUES high-severity issues, $VULNS vulnerabilities"
+          exit 1
+        fi
+
+    - name: Upload quality reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: quality-reports
+        path: |
+          pylint-report.json
+          flake8-report.txt
+          mypy-report/
+          bandit-report.json
+          safety-report.json
+
+  # Comprehensive Testing
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: opensports_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-${{ matrix.python-version }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-xdist pytest-mock
+
+    - name: Run unit tests
+      run: |
+        pytest tests/unit/ -v --cov=opensports --cov-report=xml --cov-report=html --junitxml=junit-unit.xml
+
+    - name: Run integration tests
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/opensports_test
+        REDIS_URL: redis://localhost:6379/0
+      run: |
+        pytest tests/integration/ -v --junitxml=junit-integration.xml
+
+    - name: Run performance tests
+      run: |
+        pytest tests/performance/ -v --junitxml=junit-performance.xml
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          junit-*.xml
+          htmlcov/
+          coverage.xml
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # Build and Package
+  build:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs: [quality-gate, test]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine wheel
+
+    - name: Get version
+      id: version
+      run: |
+        VERSION=$(python -c "import opensports; print(opensports.__version__)")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Build package
+      run: |
+        python -m build
+
+    - name: Check package
+      run: |
+        twine check dist/*
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: python-package
+        path: dist/
+
+  # Docker Build and Push
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        # Add your staging deployment logic here
+        # This could be Kubernetes, Docker Compose, etc.
+
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests..."
+        # Add smoke test logic here
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
+
+  # Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.event_name == 'release'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        # Add your production deployment logic here
+
+    - name: Run health checks
+      run: |
+        echo "Running health checks..."
+        # Add health check logic here
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
+
+  # Performance Monitoring
+  performance:
+    name: Performance Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run load tests
+      run: |
+        echo "Running load tests..."
+        # Add load testing logic here (e.g., k6, Artillery)
+
+    - name: Performance regression check
+      run: |
+        echo "Checking for performance regressions..."
+        # Compare with baseline performance metrics
+
+  # Documentation
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install documentation dependencies
+      run: |
+        pip install sphinx sphinx-rtd-theme myst-parser
+
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
+
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./docs/_build/html
+
+  # Notification and Reporting
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [quality-gate, test, build, docker]
+    if: always()
+    
+    steps:
+    - name: Prepare notification
+      id: prepare
+      run: |
+        QUALITY_SCORE="${{ needs.quality-gate.outputs.quality-score }}"
+        SECURITY_PASSED="${{ needs.quality-gate.outputs.security-passed }}"
+        
+        if [ "${{ needs.quality-gate.result }}" = "success" ] && \
+           [ "${{ needs.test.result }}" = "success" ] && \
+           [ "${{ needs.build.result }}" = "success" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=Pipeline completed successfully! Quality Score: $QUALITY_SCORE" >> $GITHUB_OUTPUT
+        else
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "message=Pipeline failed. Check the logs for details." >> $GITHUB_OUTPUT
+        fi
+
+    - name: Send Slack notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            "text": "${{ steps.prepare.outputs.message }}",
+            "attachments": [
+              {
+                "color": "${{ steps.prepare.outputs.status == 'success' && 'good' || 'danger' }}",
+                "fields": [
+                  {
+                    "title": "Repository",
+                    "value": "${{ github.repository }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Branch",
+                    "value": "${{ github.ref_name }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Quality Score",
+                    "value": "${{ needs.quality-gate.outputs.quality-score }}",
+                    "short": true
+                  }
+                ]
+              }
+            ]
+          }
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always() 

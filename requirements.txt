@@ -1,0 +1,23 @@
+# dbt-core==1.5.3 # Or specific dbt adapter e.g. dbt-spark
+# pyspark==3.4.1 # Usually environment-provided
+scikit-learn==1.3.0
+fastapi==0.103.1
+uvicorn[standard]
+# apache-airflow==2.7.1 # Often managed separately
+prophet==1.1.4
+torch==2.0.1
+dowhy==0.10.0
+shap==0.42.1
+greatexpectations==0.17.16
+structlog==23.1.0
+opentelemetry-api==1.19.0
+opentelemetry-sdk==1.19.0
+opentelemetry-instrumentation-fastapi==0.40b0
+# For UMAP in segmentation
+umap-learn
+# For map visualizations, if any backend processing is done for maps
+# mapboxgl
+
+# For development
+pytest
+ruff 
